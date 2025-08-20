@@ -6,9 +6,9 @@ use website_status_checker::{Config, Monitor};
 fn main() {
     // Example list of URLs to monitor.
     let urls = vec![
-        "https://ww.rust-lang.org".to_string(),
-        "https://ww.example.com".to_string(),
-        "https://google.com".to_string(),
+        "https://www.rust-lang.org".to_string(),
+        "https://www.example.com".to_string(),
+        "https://www.google.com".to_string(),
     ];
 
     // Basic configuration
