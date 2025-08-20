@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver, Sender},
-    Arc,
+    Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -17,7 +17,7 @@ pub struct WebsiteStatus {
 }
 
 impl WebsiteStatus {
-    pub fn new_success(url: &str, status: u16, rt: Duration) -> Self {
+    pub fn success(url: &str, status: u16, rt: Duration) -> Self {
         Self {
             url: url.to_string(),
             status: Ok(status),
@@ -25,7 +25,7 @@ impl WebsiteStatus {
             timestamp: Utc::now(),
         }
     }
-    pub fn new_error(url: &str, err: String, rt: Duration) -> Self {
+    pub fn error(url: &str, err: String, rt: Duration) -> Self {
         Self {
             url: url.to_string(),
             status: Err(err),
@@ -52,9 +52,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            workers: 10,
+            workers: 8,
             timeout: Duration::from_secs(5),
-            max_retries: 3,
+            max_retries: 2,
             repeat_interval: None,
         }
     }
@@ -71,11 +71,13 @@ pub struct Monitor {
     _control_handle: JoinHandle<()>,
     // Flag that tells workers to stop.
     stop_flag: Arc<AtomicBool>,
+    // The period that 'run_periodic' sleeps for (if any).
+    repeat_interval: Option<Duration>,
 }
 
 impl Monitor{
     // Create a new monitor with the given config.
-    pub fn new(config: Config) -> Self {
+    pub fn new(cfg: Config) -> Self {
         let (job_sender, job_receiver) = mpsc::channel::<String>();
         let (result_sender, result_receiver) = mpsc::channel::<WebsiteStatus>();
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -85,34 +87,44 @@ impl Monitor{
             2. feeding jobs into the workers
             3. shutting everything down gracefully
          */
-        let control_stop_flag = stop_flag.clone();
-        let workers = config.workers;
-        let timeout = config.timeout;
-        let max_retries = config.max_retries;
+        let workers = cfg.workers;
+        let timeout = cfg.timeout;
+        let max_retries = cfg.max_retries;
+        let repeat_interval = cfg.repeat_interval;
+        let stop_flag_clone = stop_flag.clone();
 
+        // Control thread (spawns workers feeds them, shuts down cleanly)
         let control_handle = thread::spawn(move || {
-            // Create workers
-            let mut worker_handles = Vec::new();
-            let (worker_job_tx, worker_job_rx) = mpsc::channel::<String>();
+            // Channel that workers listen on.
+            let (worker_tx, worker_rx) = mpsc::channel::<String>();
 
+            let shared_rx = Arc::new(Mutex::new(worker_rx));
+
+            let mut worker_handles = Vec::new();
             for _ in 0..workers {
-                let worker_job_rx = worker_job_rx.clone();
-                let worker_result_sender = result_sender.clone();
-                let worker_stop_flag = control_stop_flag.clone();
-                let worker_timeout = timeout;
-                let worker_max_retries = max_retries;
+                let rx = Arc::clone(&shared_rx);
+                let rs = result_sender.clone();
+                let sf = stop_flag_clone.clone();
+                let t = timeout;
+                let r = max_retries;
 
                 let handle = thread::spawn(move || {
                     // Each worker is a simple loop that receives jobs.
-                    while !worker_stop_flag.load(Ordering::Acquire) {
-                        let url = match worker_job_rx.recv_timeout(Duration::from_millis(100)) {
+                    loop {
+                        // 'recv()' returns immediately when the channel is closed.
+                        let url = match rx.lock().unwrap().recv(){
                             Ok(u) => u,
-                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                            Err(mpsc::RecvError) => break,
                         };
 
-                        let status = Self::check_url(&url, worker_timeout, worker_max_retries);
-                        let _ = worker_result_sender.send(status);
+                        // Exit early if the monitor is shutting down.
+                        if sf.load(Ordering::Acquire){
+                            break;
+                        }
+
+                        let res = Self::check_url(&url, t, r);
+                        let _ = rs.send(res);
+
                     }
                 });
 
@@ -120,21 +132,17 @@ impl Monitor{
             }
 
             // Feed jobs from the public 'job_sender' into the worker pool.
-            while !control_stop_flag.load(Ordering::Acquire) {
-                match job_receiver.recv_timeout(Duration::from_millis(100)) {
-                    Ok(url) => {
-                        // If the worker channel is full, drop the job - the worker pool
-                        // is already saturated.
-                        let _ = worker_job_tx.send(url);
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            for url in job_receiver {
+                if let Err(mpsc::SendError(u)) = worker_tx.send(url) {
+                    eprintln!("Failed to enque URL for worker: {}", u);
+                }
+                if stop_flag_clone.load(Ordering::Acquire){
+                    break;
                 }
             }
-
-            // Whe the control thread exits, we need to drop the worker_job_tx so that
-            // workers unblock from recv_timeout and exit.
-            drop(worker_job_tx);
+            
+            // Tell all workers that no more jobs will come.
+            drop(worker_tx);
 
             // Wait for all workers to finish.
             for h in worker_handles{
@@ -147,6 +155,7 @@ impl Monitor{
             result_receiver,
             _control_handle: control_handle,
             stop_flag,
+            repeat_interval,
         }
     }
 
@@ -155,7 +164,7 @@ impl Monitor{
             let _ = self.job_sender.send(url.clone());
         }
 
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(urls.len());
         // Pull as many results as we sent jobs
         for _ in 0..urls.len() {
             if let Ok(status) = self.result_receiver.recv(){
@@ -165,47 +174,31 @@ impl Monitor{
         results
     }
 
-    pub fn run_periodic(&self, urls: &[String]) -> Vec<WebsiteStatus> {
-        if let Some(interval) = self.job_sender
-            .as_ref()
-            .send_interval(Duration::from_secs(0))
-            .ok()
-            .and_then(|_| None)
-        {
-            let _ = interval; // unused, silence warnings
-        }
-
-        let mut all_results = Vec::new();
+    pub fn run_periodic(&self, urls: &[String]) {
+        let interval = self.repeat_interval;
         loop {
-            // Push jobs
+            // Submit the job batch.
             for url in urls {
                 let _ = self.job_sender.send(url.clone());
             }
 
-            // Collect the same number of results
+            // Collect the same number of results.
             for _ in 0..urls.len() {
                 match self.result_receiver.recv() {
-                    Ok(status) => all_results.push(status),
-                    Err(_) => return all_results,
+                    Ok(r) => println!("{:?}", r),
+                    Err(_) => return,   // channel closed - shutdown requested
                 }
             }
 
-            if let Some(interval) = self.job_sender
-                .as_ref()
-                .send_interval(Duration::from_secs(0))
-                .ok()
-                .and_then(|_| None)
-            {
-                let _ = interval;   // unused, just to silinece warnings
-            }
-
+            // Stop if shutdown was rquested.
             if self.stop_flag.load(Ordering::Acquire) {
-                break;
+                return;
             }
 
-            thread::sleep(interval);
+            if let Some(dur) = interval {
+                thread::sleep(dur);
+            }
         }
-        all_results
     }
 
     // Cracefully stop the monitor - all worker threads will exit.
@@ -216,38 +209,31 @@ impl Monitor{
     }
 
     // Helper - perfom the actual HTTP GET + timing + retry logic.
-    fn check_rls(url: &str, timeout: Duration, max_retries: usize) -> WebsiteStatus {
-        let mut attempts = 0;
+    fn check_url(url: &str, timeout: Duration, max_retries: usize) -> WebsiteStatus {
         let start = Instant::now();
-        loop {
-            attempts += 1;
-            let result = ureq::get(url)
-                .timeout(timeout)
-                .call();
-            
-            let rt = start.elapsed();
+        for attempt in 0..=max_retries {
+            let resp = ureq::get(url).timeout(timeout).call();
 
-            match result {
-                Ok(resp) => {
-                    return WbsiteStatus::new_success(url, resp.status(), rt);
-                }
-                Err(err) => {
-                    if attempts >= max_retries {
-                        return WebsiteStatus::new_error(url, err.to_string(), rt);
+            let rt = start.elapsed();
+            match resp {
+                Ok(r) => return WebsiteStatus::success(url, r.status(), rt),
+                Err(e) => {
+                    if attempt == max_retries {
+                        return WebsiteStatus::error(url, e.to_string(), rt);
                     }
-                    // Retry after a short back-off
                     thread::sleep(Duration::from_millis(200));
                 }
             }
         }
+        unreachable!("The loop above always returns");
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::net::{TcpListener, TcpStream};
-    use std::io::Write;
+    use std::net::TcpListener;
+    use std::io::{Write, Read};
     use std::thread;
     use std::time::Duration;
 
@@ -262,7 +248,7 @@ mod test {
             for stream in listener_clone.incoming().take(1) {
                 let mut stream = stream.unwrap();
                 // Read the request (discard it)
-                let mut buffer = [0; 512];
+                let mut buffer = [0u8; 512];
                 let _ = stream.read(&mut buffer);
 
                 // Send a minimal 200 OK
@@ -287,7 +273,7 @@ mod test {
         let url = format!("http://127.0.0.1:{}/", port);
 
         let monitor = Monitor::new(Config {
-            worker: 2,
+            workers: 2,
             timeout: Duration::from_secs(3),
             max_retries: 1,
             repeat_interval: None,
@@ -296,7 +282,7 @@ mod test {
         let results = monitor.run_once(&[url.clone()]);
 
         assert_eq!(results.len(), 1);
-        let status = &result[0];
+        let status = &results[0];
         assert_eq!(status.url, url);
         match &status.status {
             Ok(code) => assert_eq!(*code, 200),
@@ -322,7 +308,7 @@ mod test {
         let results = monitor.run_once(&[url.clone()]);
 
         assert_eq!(results.len(), 1);
-        let status = $results[0];
+        let status = &results[0];
         assert_eq!(status.url, url);
         match &status.status {
             Ok(_) => panic!("Expected failure"),
